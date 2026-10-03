@@ -8,14 +8,17 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from .errors import ErrorCode, OCIError
+from .reclaim import compute_reachable
+
 DEFAULT_DB_PATH = os.environ.get(
     "OCI_RESOLVER_DB", os.path.join(os.getcwd(), "data", "resolver.db")
 )
 
-# Give concurrent writers (e.g. two racing promotes) a grace period instead
-# of failing immediately with SQLITE_BUSY; the compare-and-swap then
-# serializes them deterministically.
-_BUSY_TIMEOUT_SECONDS = 5
+# Give concurrent writers (e.g. two racing promotes, or a promotion racing a
+# storage reclamation) a grace period instead of failing immediately with
+# SQLITE_BUSY; compare-and-swap then serializes them deterministically.
+_BUSY_TIMEOUT_SECONDS = 30
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS manifests (
@@ -77,6 +80,23 @@ class PromotionEvent:
     new_digest: str
     platforms: list[dict[str, Any]]
     created_at: str
+
+
+@dataclass(frozen=True)
+class ReclaimableDocument:
+    digest: str
+    size: int
+
+
+@dataclass(frozen=True)
+class ReclaimReport:
+    dry_run: bool
+    deleted: list[ReclaimableDocument]
+    deleted_bytes: int
+    remaining: int
+    reachable: int
+    roots: int
+    dangling: list[str]
 
 
 class ChannelConflict(Exception):
@@ -351,3 +371,102 @@ class Repository:
                 (name, revision),
             ).fetchone()
         return row is not None
+
+    # ------------------------------------------------------------------
+    # Storage reclamation (garbage collection)
+    # ------------------------------------------------------------------
+
+    def reclaim_manifests(
+        self,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> ReclaimReport:
+        """Delete stored documents not reachable from any channel.
+
+        Roots are the union of every channel's current digest and every
+        promotion ledger ``root_digest``.  From each root the manifests
+        descriptors of stored Index documents are followed recursively;
+        anything stored outside that reachable set is a deletion candidate.
+
+        The whole operation runs in a single ``BEGIN IMMEDIATE`` transaction,
+        which is the same write lock taken by :meth:`promote_channel`, so no
+        promotion can move a pointer while reachability is computed or rows
+        are deleted.  Any resolution/parsing failure rolls the transaction
+        back and the database is left untouched.
+
+        When ``dry_run`` is true the candidates are only reported; the
+        transaction is rolled back.  When ``limit`` is given at most that many
+        candidates are deleted, chosen by smallest digest in lexicographic
+        order; ``remaining`` reports the candidates left for a later run.
+        """
+        conn = self._connect()
+        try:
+            # Take the write lock before reading anything: concurrent
+            # promotions (and ingests) now block until the sweep finishes, so
+            # the reachable set is computed over one stable snapshot.
+            conn.execute("BEGIN IMMEDIATE")
+
+            root_rows = conn.execute(
+                "SELECT current_digest AS digest FROM channels "
+                "UNION "
+                "SELECT root_digest AS digest FROM channel_promotions "
+                "WHERE root_digest IS NOT NULL"
+            ).fetchall()
+            roots = list(dict.fromkeys(row["digest"] for row in root_rows))
+
+            reachable, dangling = compute_reachable(conn, roots)
+
+            all_rows = conn.execute(
+                "SELECT digest, bytes FROM manifests ORDER BY digest"
+            ).fetchall()
+            candidates = [
+                ReclaimableDocument(digest=row["digest"], size=row["bytes"])
+                for row in all_rows
+                if row["digest"] not in reachable
+            ]
+
+            to_delete = candidates if limit is None else candidates[:limit]
+            remaining = len(candidates) - len(to_delete)
+            deleted_bytes = sum(item.size for item in to_delete)
+
+            if not dry_run and to_delete:
+                deleted_count = 0
+                for item in to_delete:
+                    cursor = conn.execute(
+                        "DELETE FROM manifests WHERE digest = ?",
+                        (item.digest,),
+                    )
+                    deleted_count += cursor.rowcount
+                if deleted_count != len(to_delete):
+                    raise OCIError(
+                        ErrorCode.RECLAIM_FAILED,
+                        "Reclamation deleted an unexpected number of rows; "
+                        "the transaction was rolled back.",
+                        {
+                            "expected": len(to_delete),
+                            "actual": deleted_count,
+                        },
+                    )
+
+            report = ReclaimReport(
+                dry_run=dry_run,
+                deleted=list(to_delete),
+                deleted_bytes=deleted_bytes,
+                remaining=remaining,
+                reachable=len(reachable),
+                roots=len(roots),
+                dangling=dangling,
+            )
+
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return report

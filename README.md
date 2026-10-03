@@ -11,6 +11,10 @@ Image Manifest**，并返回整条摘要链。
 Manifest，全部成功后在单个 SQLite 事务中以 compare-and-swap 原子移动通道指针，并向不可变
 晋级流水追加一条记录。
 
+服务还提供**清单存储回收**维护操作：以所有通道当前摘要与全部晋级历史 `rootDigest` 为根，
+递归计算可达的 OCI 文档集合，在单个 SQLite 写事务中删除集合之外的清单（支持 `dryRun`
+预览与 `limit` 分批），事务期间晋级被阻塞，任何失败整体回滚。
+
 ## 一条命令启动
 
 需要本机已安装 Docker（含 Compose 插件）：
@@ -208,6 +212,72 @@ Content-Type: application/json
 
 最后一页之后 `nextCursor` 为 `null`（不会导向空页）。历史记录只追加、永不修改或删除。
 
+### 6. 清单存储回收（维护操作）
+
+长期运行后库中会残留不再被任何发布引用的 OCI 文档。维护接口以**可达性分析**回收它们：
+
+- **根集合**：所有通道的当前摘要（`currentDigest`）**与全部晋级历史的 `rootDigest`**
+  （因此指针移走后，老版本只要还在历史流水里就不会被删）；
+- 从每个根出发，**递归跟随 Image Index（及 Docker manifest list）的 `manifests`
+  子描述符摘要**，计算可达集合（Image Manifest 是叶子，不再向下）；
+- 只删除**可达集合之外**的 `manifests` 行。删除后所有现有通道的解析结果保持不变。
+
+```
+POST /maintenance/reclaim
+Content-Type: application/json
+
+{ "dryRun": false, "limit": 100 }
+```
+
+- 请求体可省略（等价于 `{}`）：`dryRun` 默认 `false`（真正删除）；
+- `limit` 为可选正整数：给出时最多删除**按摘要字典序最小**的若干候选，
+  便于分批回收；响应中的 `remaining` 是本次之后仍可回收的候选数量；
+- `dryRun: true` 时只返回**将删除的摘要与各自字节数**（`deleted`）及合计
+  `deletedBytes`，**不写库**（事务直接回滚）；
+- 整个分析与删除在**单个 SQLite 写事务**（`BEGIN IMMEDIATE`）中完成，
+  与晋级使用同一把写锁——**事务期间晋级被阻塞**，分析基于一份一致快照；
+- 解析或删除过程中任何失败（存储的 Index JSON 损坏、`manifests` 项非法、
+  子摘要格式错误等）都会让事务**整体回滚，不删除任何文档**，并返回
+  `409 RECLAIM_FAILED`（details 指出出错摘要）；
+- 引用了**尚未录入**文档的子摘要不属于解析失败：不会让任何已存储文档可达，
+  会被跳过并在响应的 `danglingReferences` 中报告。
+
+成功响应（200）：
+
+```json
+{
+  "dryRun": false,
+  "deleted": [
+    { "digest": "sha256:e1e7...", "bytes": 207 }
+  ],
+  "deletedCount": 1,
+  "deletedBytes": 207,
+  "remaining": 0,
+  "reachable": 5,
+  "roots": 2,
+  "danglingReferences": []
+}
+```
+
+`deleted`/`deletedCount`/`deletedBytes` 在 `dryRun` 下表示**若执行将删除**的内容；
+`reachable` 为可达文档数，`roots` 为去重后的根摘要数。
+
+调用示例：
+
+```bash
+# 1) 先预览将回收什么（不改库）
+curl -sS -X POST http://localhost:8000/maintenance/reclaim \
+  -H 'Content-Type: application/json' -d '{"dryRun":true}'
+
+# 2) 真正回收
+curl -sS -X POST http://localhost:8000/maintenance/reclaim
+
+# 3) 分批回收：每批最多删除字典序最小的 100 个候选，
+#    响应 remaining > 0 时重复调用即可
+curl -sS -X POST http://localhost:8000/maintenance/reclaim \
+  -H 'Content-Type: application/json' -d '{"limit":100}'
+```
+
 ### 错误响应格式
 
 所有错误均为：
@@ -233,6 +303,7 @@ Content-Type: application/json
 | `CHANNEL_NOT_FOUND` | 404 | 通道尚不存在（从未成功晋级） |
 | `PROMOTION_FAILED` | 409 | 晋级被拒：至少一个目标平台无法唯一解析（details 含逐平台 `results`/`failures`），通道不变 |
 | `PROMOTION_CONFLICT` | 409 | `expectedDigest` 与通道当前值不一致（compare-and-swap 失败），未写入 |
+| `RECLAIM_FAILED` | 409 | 存储回收过程中解析/删除失败，事务整体回滚，未删除任何文档（details 含出错摘要） |
 
 ## 端到端示例
 
@@ -268,6 +339,11 @@ curl -sS -X POST http://localhost:8000/channels/stable/promote \
 # 5) 查询当前值与晋级历史
 curl -sS http://localhost:8000/channels/stable
 curl -sS 'http://localhost:8000/channels/stable/events?limit=20'
+
+# 6) 回收不再被任何通道（当前值 + 晋级历史）引用的清单（先 dryRun 预览）
+curl -sS -X POST http://localhost:8000/maintenance/reclaim \
+  -H 'Content-Type: application/json' -d '{"dryRun":true}'
+curl -sS -X POST http://localhost:8000/maintenance/reclaim
 ```
 
 ## 运行测试
@@ -280,7 +356,10 @@ pytest -q
 测试覆盖：精确匹配、variant / os.version 精确优先与空值回退、os.features 全包含、
 同优先级歧义、缺失摘要、mediaType 不一致、循环引用、深度超限、嵌套递归、摘要链、
 Docker 媒体类型与幂等录入；以及通道晋级的多平台解析、平台级诊断与失败原子性、
-compare-and-swap 冲突（含并发竞争）、不可变序号流水与游标分页。
+compare-and-swap 冲突（含并发竞争）、不可变序号流水与游标分页；以及存储回收的
+根集合（当前指针 + 晋级历史 rootDigest）、嵌套 Index 可达性、dryRun 不改库、
+limit 字典序分批与 `remaining`、无根时全量可回收、悬挂引用报告、解析失败整体
+回滚、事务期间晋级被阻塞。
 
 ## 项目结构
 
@@ -290,8 +369,9 @@ app/
   resolver.py   递归解析、链 / 循环 / 深度 / mediaType 校验
   platform.py   平台筛选与候选排序
   channels.py   晋级编排（逐平台解析、诊断收集）与历史游标
+  reclaim.py    存储回收的可达性分析（根集合 + Index manifests 递归）
   oci.py        mediaType、digest 与文档类型工具
-  storage.py    SQLite 存储（清单、通道指针、不可变晋级流水）
+  storage.py    SQLite 存储（清单、通道指针、不可变晋级流水、回收事务）
   errors.py     错误码与 HTTP 状态映射
 Dockerfile
 compose.yaml

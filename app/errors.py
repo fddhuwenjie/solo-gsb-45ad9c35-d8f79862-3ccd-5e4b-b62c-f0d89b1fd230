@@ -21,6 +21,7 @@ class ErrorCode:
     CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
     PROMOTION_FAILED = "PROMOTION_FAILED"
     PROMOTION_CONFLICT = "PROMOTION_CONFLICT"
+    RECLAIM_FAILED = "RECLAIM_FAILED"
 
 
 # Resolver errors are all surfaced as 409 Conflict: the stored graph itself is
@@ -40,6 +41,7 @@ ERROR_STATUS: dict[str, int] = {
     ErrorCode.CHANNEL_NOT_FOUND: 404,
     ErrorCode.PROMOTION_FAILED: 409,
     ErrorCode.PROMOTION_CONFLICT: 409,
+    ErrorCode.RECLAIM_FAILED: 409,
 }
 
 

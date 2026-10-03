@@ -27,6 +27,7 @@ from .storage import (
     ChannelConflict,
     DEFAULT_DB_PATH,
     PromotionEvent,
+    ReclaimReport,
     Repository,
 )
 
@@ -38,7 +39,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="OCI Image Manifest Resolver",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Ingest OCI Image Index / Manifest documents, resolve a unique "
         "deployable manifest for a requested platform, and promote release "
@@ -512,3 +513,83 @@ def list_channel_events(
         "items": items,
         "nextCursor": next_cursor,
     }
+
+
+# ---------------------------------------------------------------------------
+# Storage maintenance: reclamation of unreferenced manifests
+# ---------------------------------------------------------------------------
+
+
+async def _parse_reclaim_body(http_request: Request) -> tuple[bool, int | None]:
+    """Parse the optional ``{"dryRun": bool, "limit": int}`` request body."""
+    raw = await http_request.body()
+    if not raw:
+        return False, None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise OCIError(
+            ErrorCode.INVALID_REQUEST,
+            f"Request body is not valid JSON: {exc}",
+        )
+    if not isinstance(payload, dict):
+        raise OCIError(
+            ErrorCode.INVALID_REQUEST,
+            "Request body must be a JSON object.",
+        )
+
+    dry_run = payload.get("dryRun", False)
+    if not isinstance(dry_run, bool):
+        raise OCIError(
+            ErrorCode.INVALID_REQUEST,
+            "Field 'dryRun' must be a boolean when present.",
+        )
+
+    limit = payload.get("limit")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise OCIError(
+                ErrorCode.INVALID_REQUEST,
+                "Field 'limit' must be a positive integer when present.",
+            )
+        if limit < 1:
+            raise OCIError(
+                ErrorCode.INVALID_REQUEST,
+                "Field 'limit' must be a positive integer (>= 1).",
+                {"limit": limit},
+            )
+
+    return dry_run, limit
+
+
+def _reclaim_to_json(report: ReclaimReport) -> dict[str, Any]:
+    return {
+        "dryRun": report.dry_run,
+        "deleted": [
+            {"digest": item.digest, "bytes": item.size}
+            for item in report.deleted
+        ],
+        "deletedCount": len(report.deleted),
+        "deletedBytes": report.deleted_bytes,
+        "remaining": report.remaining,
+        "reachable": report.reachable,
+        "roots": report.roots,
+        "danglingReferences": report.dangling,
+    }
+
+
+@app.post("/maintenance/reclaim")
+async def reclaim_storage(
+    http_request: Request, repo: Repository = Depends(get_repository)
+) -> dict:
+    """Reclaim stored OCI documents not referenced by any channel.
+
+    Reachability roots are every channel's current digest and every promotion
+    history ``rootDigest``; Index ``manifests`` descriptors are followed
+    recursively and only documents outside the reachable set are deleted.  The
+    operation runs in one SQLite write transaction (promotions block until it
+    finishes) and any failure rolls it back completely.
+    """
+    dry_run, limit = await _parse_reclaim_body(http_request)
+    report = repo.reclaim_manifests(dry_run=dry_run, limit=limit)
+    return _reclaim_to_json(report)
