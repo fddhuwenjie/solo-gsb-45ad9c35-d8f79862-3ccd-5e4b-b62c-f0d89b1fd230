@@ -1,0 +1,16 @@
+services:
+  oci-resolver:
+    build: .
+    image: oci-manifest-resolver:latest
+    container_name: oci-manifest-resolver
+    ports:
+      - "8000:8000"
+    volumes:
+      - oci-resolver-data:/data
+    environment:
+      OCI_RESOLVER_DB: /data/resolver.db
+      OCI_MAX_INDEX_HOPS: "32"
+    restart: unless-stopped
+
+volumes:
+  oci-resolver-data:
