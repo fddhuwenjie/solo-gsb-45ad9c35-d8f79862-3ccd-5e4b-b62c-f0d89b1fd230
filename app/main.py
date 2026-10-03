@@ -7,7 +7,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Body, Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
@@ -26,6 +26,7 @@ from .resolver import resolve
 from .storage import (
     ChannelConflict,
     DEFAULT_DB_PATH,
+    GCError,
     PromotionEvent,
     Repository,
 )
@@ -38,11 +39,12 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="OCI Image Manifest Resolver",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Ingest OCI Image Index / Manifest documents, resolve a unique "
-        "deployable manifest for a requested platform, and promote release "
-        "channels atomically."
+        "deployable manifest for a requested platform, promote release "
+        "channels atomically, and reclaim documents no release record "
+        "references."
     ),
     lifespan=lifespan,
 )
@@ -511,4 +513,68 @@ def list_channel_events(
         "channel": name,
         "items": items,
         "nextCursor": next_cursor,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Maintenance: manifest garbage collection
+# ---------------------------------------------------------------------------
+
+
+@app.post("/maintenance/gc")
+def garbage_collect(
+    payload: dict[str, Any] | None = Body(default=None),
+    repo: Repository = Depends(get_repository),
+) -> dict:
+    """Reclaim stored documents no release record references.
+
+    Roots are every channel's current digest plus every promotion ledger
+    ``rootDigest``; Index ``manifests`` arrays are followed recursively.
+    The whole mark-and-sweep runs in a single SQLite write transaction
+    (``BEGIN IMMEDIATE``), so promotions are blocked while it runs and any
+    failure rolls the transaction back wholesale — existing channels keep
+    resolving afterwards.
+
+    ``dryRun`` (default ``false``) only reports the digests and total
+    bytes that *would* be deleted, leaving the database untouched;
+    ``limit`` caps the pass to the lexicographically smallest candidate
+    digests and reports how many candidates ``remaining`` afterwards.
+    """
+    dry_run = False
+    limit: int | None = None
+    if payload is not None:
+        if not isinstance(payload, dict):
+            raise OCIError(
+                ErrorCode.INVALID_REQUEST,
+                "Request body must be a JSON object.",
+            )
+        dry_run = payload.get("dryRun", False)
+        if not isinstance(dry_run, bool):
+            raise OCIError(
+                ErrorCode.INVALID_REQUEST,
+                "Field 'dryRun' must be a boolean.",
+            )
+        limit = payload.get("limit")
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+        ):
+            raise OCIError(
+                ErrorCode.INVALID_REQUEST,
+                "Field 'limit' must be a positive integer when present.",
+            )
+
+    try:
+        result = repo.collect_garbage(dry_run=dry_run, limit=limit)
+    except GCError as exc:
+        raise OCIError(ErrorCode.GC_FAILED, str(exc))
+
+    return {
+        "dryRun": result.dry_run,
+        "roots": result.roots,
+        "reachable": result.reachable,
+        "candidates": result.candidates,
+        "limit": result.limit,
+        "digests": result.digests,
+        "bytes": result.bytes,
+        "remaining": result.remaining,
     }

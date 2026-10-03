@@ -11,6 +11,10 @@ Image Manifest**，并返回整条摘要链。
 Manifest，全部成功后在单个 SQLite 事务中以 compare-and-swap 原子移动通道指针，并向不可变
 晋级流水追加一条记录。
 
+服务还提供**清单存储回收（垃圾回收）**维护操作：以所有通道当前摘要与晋级历史 `rootDigest`
+为根，递归标记 Index 的 `manifests` 引用，把不再被任何发布记录引用的清单文档在单个 SQLite
+写事务中删除；支持 `dryRun` 预演与 `limit` 分批限量，回收后已有通道仍可正常解析。
+
 ## 一条命令启动
 
 需要本机已安装 Docker（含 Compose 插件）：
@@ -208,6 +212,58 @@ Content-Type: application/json
 
 最后一页之后 `nextCursor` 为 `null`（不会导向空页）。历史记录只追加、永不修改或删除。
 
+### 6. 清单存储回收（维护操作）
+
+```
+POST /maintenance/gc
+Content-Type: application/json
+
+{ "dryRun": true, "limit": 100 }
+```
+
+请求体可整体省略（等价于 `{}`）。字段：
+
+- `dryRun`：可选，默认 `false`。为 `true` 时只计算并返回**将被删除**的摘要列表与总
+  字节数，不修改数据库；
+- `limit`：可选正整数。给出时本次最多删除 `limit` 个候选，优先删除**摘要字典序最小**
+  的文档；响应中的 `remaining` 给出本次之后仍剩余的候选数量，便于分批回收。
+
+**可达性规则**：以所有通道的当前摘要和晋级流水中全部 `rootDigest` 为根，递归跟随 Index
+文档 `manifests` 数组中的子摘要；可达集合之外的已存储文档即为垃圾。整个标记-清除在**同一
+个 SQLite 写事务**（`BEGIN IMMEDIATE`）中完成：事务期间晋级操作被阻塞，任何解析或删除
+失败都会整体回滚，已有通道在回收后仍可正常解析。
+
+成功响应（200）：
+
+```json
+{
+  "dryRun": false,
+  "roots": 3,
+  "reachable": 5,
+  "candidates": 4,
+  "limit": 2,
+  "digests": ["sha256:11...", "sha256:22..."],
+  "bytes": 2048,
+  "remaining": 2
+}
+```
+
+`roots` / `reachable` / `candidates` 分别为根摘要数、可达文档数与垃圾候选总数；
+`digests` 与 `bytes` 是本次实际删除（`dryRun` 时为**将要**删除）的摘要列表与总字节数。
+
+```bash
+# 预演：只看会删什么，不改库
+curl -sS -X POST http://localhost:8000/maintenance/gc \
+  -H 'Content-Type: application/json' -d '{"dryRun": true}'
+
+# 实际回收，本次最多删除 100 个（字典序最小优先）
+curl -sS -X POST http://localhost:8000/maintenance/gc \
+  -H 'Content-Type: application/json' -d '{"limit": 100}'
+
+# 不带请求体：回收全部垃圾
+curl -sS -X POST http://localhost:8000/maintenance/gc
+```
+
 ### 错误响应格式
 
 所有错误均为：
@@ -233,6 +289,7 @@ Content-Type: application/json
 | `CHANNEL_NOT_FOUND` | 404 | 通道尚不存在（从未成功晋级） |
 | `PROMOTION_FAILED` | 409 | 晋级被拒：至少一个目标平台无法唯一解析（details 含逐平台 `results`/`failures`），通道不变 |
 | `PROMOTION_CONFLICT` | 409 | `expectedDigest` 与通道当前值不一致（compare-and-swap 失败），未写入 |
+| `GC_FAILED` | 500 | 回收事务执行失败，已整体回滚，数据库未发生变化 |
 
 ## 端到端示例
 
@@ -268,6 +325,12 @@ curl -sS -X POST http://localhost:8000/channels/stable/promote \
 # 5) 查询当前值与晋级历史
 curl -sS http://localhost:8000/channels/stable
 curl -sS 'http://localhost:8000/channels/stable/events?limit=20'
+
+# 6) 清单存储回收：先 dryRun 预演（只看将删除的摘要与字节数），再实际执行
+curl -sS -X POST http://localhost:8000/maintenance/gc \
+  -H 'Content-Type: application/json' -d '{"dryRun": true}'
+curl -sS -X POST http://localhost:8000/maintenance/gc \
+  -H 'Content-Type: application/json' -d '{"limit": 100}'
 ```
 
 ## 运行测试
@@ -280,7 +343,9 @@ pytest -q
 测试覆盖：精确匹配、variant / os.version 精确优先与空值回退、os.features 全包含、
 同优先级歧义、缺失摘要、mediaType 不一致、循环引用、深度超限、嵌套递归、摘要链、
 Docker 媒体类型与幂等录入；以及通道晋级的多平台解析、平台级诊断与失败原子性、
-compare-and-swap 冲突（含并发竞争）、不可变序号流水与游标分页。
+compare-and-swap 冲突（含并发竞争）、不可变序号流水与游标分页；以及清单回收的
+dryRun 预演、`limit` 限量与字典序、历史 `rootDigest` 保活、嵌套树保留、回收后通道
+仍可解析、回收事务阻塞并发晋级与失败整体回滚。
 
 ## 项目结构
 
@@ -290,8 +355,9 @@ app/
   resolver.py   递归解析、链 / 循环 / 深度 / mediaType 校验
   platform.py   平台筛选与候选排序
   channels.py   晋级编排（逐平台解析、诊断收集）与历史游标
+  gc.py         垃圾回收可达性标记（通道/历史根集合 → 递归 Index 引用）
   oci.py        mediaType、digest 与文档类型工具
-  storage.py    SQLite 存储（清单、通道指针、不可变晋级流水）
+  storage.py    SQLite 存储（清单、通道指针、不可变晋级流水、回收事务）
   errors.py     错误码与 HTTP 状态映射
 Dockerfile
 compose.yaml

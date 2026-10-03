@@ -8,6 +8,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from .gc import reachable_digests, select_garbage
+
 DEFAULT_DB_PATH = os.environ.get(
     "OCI_RESOLVER_DB", os.path.join(os.getcwd(), "data", "resolver.db")
 )
@@ -79,6 +81,18 @@ class PromotionEvent:
     created_at: str
 
 
+@dataclass(frozen=True)
+class GCResult:
+    dry_run: bool
+    roots: int
+    reachable: int
+    candidates: int
+    limit: int | None
+    digests: list[str]
+    bytes: int
+    remaining: int
+
+
 class ChannelConflict(Exception):
     """Raised when a compare-and-swap promotion loses the race.
 
@@ -93,6 +107,14 @@ class ChannelConflict(Exception):
         self.channel = channel
         self.expected = expected
         self.actual = actual
+
+
+class GCError(Exception):
+    """Raised when a garbage collection pass fails.
+
+    The write transaction has already been rolled back, so the database
+    is exactly as it was before the attempt.
+    """
 
 
 class Repository:
@@ -168,6 +190,85 @@ class Repository:
     def count(self) -> int:
         with self._connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM manifests").fetchone()[0]
+
+    # ------------------------------------------------------------------
+    # Garbage collection
+    # ------------------------------------------------------------------
+
+    def collect_garbage(
+        self, *, dry_run: bool = False, limit: int | None = None
+    ) -> GCResult:
+        """Delete stored documents unreachable from any release record.
+
+        Roots are every channel's current digest plus every promotion
+        ledger ``root_digest``; Index ``manifests`` arrays are followed
+        recursively.  The whole mark-and-sweep runs in a single
+        ``BEGIN IMMEDIATE`` transaction, so a concurrent promotion blocks
+        until the sweep finishes and can never interleave with it; any
+        failure rolls the transaction back wholesale.  ``dry_run`` only
+        plans the sweep (the transaction is rolled back, nothing is
+        deleted) and ``limit`` caps how many of the lexicographically
+        smallest candidate digests are deleted in this pass.
+        """
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be a positive integer")
+
+        conn = self._connect()
+        try:
+            # Acquire the write lock up front: promotions (which also open
+            # with BEGIN IMMEDIATE) serialize behind this sweep instead of
+            # racing it.
+            conn.execute("BEGIN IMMEDIATE")
+            roots = {
+                row[0]
+                for row in conn.execute("SELECT current_digest FROM channels")
+            }
+            roots.update(
+                row[0]
+                for row in conn.execute(
+                    "SELECT root_digest FROM channel_promotions"
+                )
+            )
+            rows = conn.execute(
+                "SELECT digest, media_type, doc, bytes FROM manifests"
+            ).fetchall()
+            documents = {
+                row["digest"]: (row["media_type"], json.loads(row["doc"]))
+                for row in rows
+            }
+            sizes = {row["digest"]: row["bytes"] for row in rows}
+
+            reachable = reachable_digests(documents, roots)
+            selected, remaining = select_garbage(documents, reachable, limit)
+
+            if not dry_run and selected:
+                conn.executemany(
+                    "DELETE FROM manifests WHERE digest = ?",
+                    [(digest,) for digest in selected],
+                )
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            raise GCError(
+                "garbage collection failed; the transaction was rolled "
+                f"back: {exc}"
+            ) from exc
+        finally:
+            conn.close()
+
+        return GCResult(
+            dry_run=dry_run,
+            roots=len(roots),
+            reachable=len(reachable),
+            candidates=len(selected) + remaining,
+            limit=limit,
+            digests=selected,
+            bytes=sum(sizes[digest] for digest in selected),
+            remaining=remaining,
+        )
 
     # ------------------------------------------------------------------
     # Release channels
